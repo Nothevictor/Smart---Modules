@@ -1,6 +1,6 @@
 /// SPDX-License-Identifier: MIT
-/// @title: Contract for a wallet with multisig withdrawal for multiple ERC20 tokens.
-/// @notice: Allows withdrawing ERC20 tokens from the vault only if a certain number of signers approve the transaction.
+/// @title: Contract for wallet with multisig withdraw functionality.
+/// @notice: Allows to withdraw funds from the vault only if a certain number of signers approve the transaction.
 /// @author: Solidity University
 pragma solidity ^0.8.30;
 
@@ -29,10 +29,10 @@ contract VaultMultisig {
     }
 
     /// @notice The mapping of transfer IDs to transfer details
-    mapping (uint256 => Transfer) private transfers;
+    mapping(uint256 => Transfer) private transfers;
 
     /// @notice The mapping for verification that address is a signer
-    mapping (address => bool) private multiSigSigners;
+    mapping(address => bool) private multiSigSigners;
 
     /// @notice Checks that signers array is not empty
     error SignersArrayCannotBeEmpty();
@@ -66,6 +66,9 @@ contract VaultMultisig {
     /// @notice Checks that the transfer failed
     /// @param transferId The ID of the transfer
     error TransferFailed(uint256 transferId);
+
+    /// @notice Cheks that contract balance is positiv
+    error VaultIsEmpty();
 
     /// @notice Checks that quorum was reached for transfer
     /// @param transferId The ID of the transfer
@@ -101,10 +104,7 @@ contract VaultMultisig {
     /// @notice Initializes the multisig contract
     /// @param _signers The array of multisig signers
     /// @param _quorum The number of signatures required to execute a transaction
-    constructor(
-        address[] memory _signers,
-        uint256 _quorum
-    ) {
+    constructor(address[] memory _signers, uint256 _quorum) {
         if (_signers.length == 0) revert SignersArrayCannotBeEmpty();
         if (_quorum > _signers.length) revert QuorumGreaterThanSigners();
         if (_quorum == 0) revert QuorumCannotBeZero();
@@ -113,6 +113,7 @@ contract VaultMultisig {
             multiSigSigners[_signers[i]] = true;
         }
 
+        currentMultiSigSigners = _signers;
         quorum = _quorum;
     }
 
@@ -122,12 +123,13 @@ contract VaultMultisig {
     function initiateTransfer(address _to, uint256 _amount) external onlyMultisigSigner {
         if (_to == address(0)) revert InvalidRecipient();
         if (_amount <= 0) revert InvalidAmount();
+        if (address(this).balance <= 0) revert VaultIsEmpty();
 
         uint256 transferId = transfersCount++;
         Transfer storage transfer = transfers[transferId];
         transfer.to = _to;
         transfer.amount = _amount;
-        transfer.approvals = 0;
+        transfer.approvals = transfer.approvals + 1;
         transfer.executed = false;
         transfer.approved[msg.sender] = true;
 
@@ -153,14 +155,39 @@ contract VaultMultisig {
         if (transfer.executed) revert TransferIsAlreadyExecuted(_transferId);
 
         uint256 balance = address(this).balance;
-        if (transfer.amount >= balance) revert InsufficientBalance(balance, transfer.amount);
+        if (transfer.amount > balance) revert InsufficientBalance(balance, transfer.amount);
 
-        (bool success, ) = transfer.to.call{value: transfer.amount}("");
+        (bool success,) = transfer.to.call{value: transfer.amount}("");
         if (!success) revert TransferFailed(_transferId);
 
         transfer.executed = true;
 
         emit TransferExecuted(_transferId);
+    }
+
+    /// @notice Updates the list of multisig signers and sets a new quorum
+    /// @dev Only callable by all current signers via consensus (i.e., must call from multisig itself)
+    /// @param newSigners The new array of signer addresses
+    /// @param newQuorum The new required quorum
+    function updateSignersAndQuorum(address[] memory newSigners, uint256 newQuorum) public onlyMultisigSigner {
+        if (newSigners.length == 0) revert SignersArrayCannotBeEmpty();
+        if (newQuorum > newSigners.length) revert QuorumGreaterThanSigners();
+        if (newQuorum == 0) revert QuorumCannotBeZero();
+
+        // Сброс старых подписантов
+        for (uint256 i = 0; i < currentMultiSigSigners.length; i++) {
+            multiSigSigners[currentMultiSigSigners[i]] = false;
+        }
+
+        // Установка новых подписантов
+        for (uint256 i = 0; i < newSigners.length; i++) {
+            multiSigSigners[newSigners[i]] = true;
+        }
+        currentMultiSigSigners = newSigners;
+        quorum = newQuorum;
+
+        emit MultiSigSignersUpdated();
+        emit QuorumUpdated(newQuorum);
     }
 
     /// @notice Default fallback function for receiving ETH
@@ -172,12 +199,11 @@ contract VaultMultisig {
     /// @return amount The amount of tokens to transfer
     /// @return approvals The number of approvals required to execute the transfer
     /// @return executed Whether the transfer has been executed
-    function getTransfer(uint256 _transferId) external view returns (
-        address to,
-        uint256 amount,
-        uint256 approvals,
-        bool executed
-    ) {
+    function getTransfer(uint256 _transferId)
+        external
+        view
+        returns (address to, uint256 amount, uint256 approvals, bool executed)
+    {
         Transfer storage transfer = transfers[_transferId];
         return (transfer.to, transfer.amount, transfer.approvals, transfer.executed);
     }
